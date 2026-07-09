@@ -1,4 +1,4 @@
-# DuckDB-HA
+# MotherDuck-HA
 
 <img width="1254" height="1254" alt="ChatGPT Image Jul 9, 2026, 02_46_16 PM" src="https://github.com/user-attachments/assets/368a35d4-d482-4563-a640-bdf946e894e2" />
 

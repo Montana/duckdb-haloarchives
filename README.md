@@ -42,6 +42,9 @@ The staging layer is useful for:
 ├── stage_haloarchives_duckdb.py
 └── README.md
 ```
+Below is the flow of MotherDuck + HA
+
+<img width="1448" height="1086" alt="image" src="https://github.com/user-attachments/assets/ef564c9b-e970-4856-9c34-bf32eb404b78" />
 
 The default source SQLite file is intentionally named:
 

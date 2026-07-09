@@ -3,7 +3,7 @@
 <img width="1254" height="1254" alt="ChatGPT Image Jul 9, 2026, 02_46_16 PM" src="https://github.com/user-attachments/assets/368a35d4-d482-4563-a640-bdf946e894e2" />
 
 
-**DuckDB-HA** is a deliberately over-engineered staging pipeline for loading a HaloArchives-style SQLite archive into either a local DuckDB analytical database or a MotherDuck-hosted DuckDB database.
+**DuckDB-HA** is a deliberately over-engineered staging pipeline for loading a HaloArchives-style SQLite archive into either a local DuckDB analytical database or a MotherDuck-hosted DuckDB database so people not as technically inclined helping me can interact with the DB.
 
 It turns a source SQLite file into a query-friendly staging layer with audit metadata, source manifests, table inventory views, and JSON run output.
 

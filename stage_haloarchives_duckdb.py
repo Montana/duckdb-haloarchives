@@ -2,20 +2,24 @@
 """
 stage_haloarchives_duckdb.py
 
-A deliberately over-engineered local staging utility for moving HaloArchives-style
-SQLite data into a DuckDB analytical staging layer.
+A deliberately over-engineered local / MotherDuck staging utility for moving
+HaloArchives-style SQLite data into a DuckDB analytical staging layer.
 
-Default source:
+Default local source:
     data/blam-fragment-store.sqlite
 
-Default target:
+Default local target:
     data/haloarchives.duckdb
+
+Optional cloud target:
+    MotherDuck database via --target motherduck
 """
 
 import argparse
 import hashlib
 import json
 import logging
+import os
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -28,6 +32,7 @@ import duckdb
 DEFAULT_SQLITE_DB = Path("data/blam-fragment-store.sqlite")
 DEFAULT_DUCKDB_DB = Path("data/haloarchives.duckdb")
 DEFAULT_MANIFEST_JSON = Path("data/stage_manifest.json")
+DEFAULT_MOTHERDUCK_DB = "duckdb_ha"
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,8 @@ class SourceTable:
 @dataclass
 class StageResult:
     run_id: str
+    target_mode: str
+    target_database: str
     source_catalog: str | None
     source_schema: str | None
     source_table: str
@@ -54,23 +61,14 @@ class StageResult:
 
 
 def quote_ident(identifier: str) -> str:
-    """
-    Safely quote a DuckDB identifier such as a schema, table, or column name.
-    """
     return '"' + identifier.replace('"', '""') + '"'
 
 
 def quote_literal(value: str) -> str:
-    """
-    Safely quote a SQL string literal.
-    """
     return "'" + value.replace("'", "''") + "'"
 
 
 def quote_path(path: Path) -> str:
-    """
-    Safely quote a filesystem path for ATTACH statements.
-    """
     return str(path).replace("'", "''")
 
 
@@ -78,8 +76,8 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def build_run_id(sqlite_db: Path) -> str:
-    raw = f"{sqlite_db.resolve()}::{now_utc()}"
+def build_run_id(sqlite_db: Path, target_mode: str, target_database: str) -> str:
+    raw = f"{sqlite_db.resolve()}::{target_mode}::{target_database}::{now_utc()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -92,12 +90,6 @@ def configure_logging(verbose: bool) -> None:
 
 
 def load_sqlite_extension(con: duckdb.DuckDBPyConnection) -> None:
-    """
-    DuckDB needs the sqlite extension in order to attach SQLite databases.
-
-    Try LOAD first in case the extension is already installed locally.
-    If that fails, install it and then load it.
-    """
     try:
         con.execute("LOAD sqlite;")
         logging.debug("Loaded DuckDB sqlite extension")
@@ -107,13 +99,55 @@ def load_sqlite_extension(con: duckdb.DuckDBPyConnection) -> None:
         con.execute("LOAD sqlite;")
 
 
-def connect_duckdb(db_path: Path) -> duckdb.DuckDBPyConnection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+def ensure_motherduck_token(token_env: str) -> None:
+    """
+    MotherDuck can use the lowercase `motherduck_token` env var directly.
 
-    con = duckdb.connect(str(db_path))
+    This lets you keep a token under MOTHERDUCK_TOKEN locally while still
+    setting the env var MotherDuck expects before connection.
+    """
+    if os.getenv("motherduck_token"):
+        return
+
+    token = os.getenv(token_env)
+
+    if token:
+        os.environ["motherduck_token"] = token
+        return
+
+    raise RuntimeError(
+        "MotherDuck target selected, but no token was found. "
+        "Set `motherduck_token` or set `MOTHERDUCK_TOKEN`."
+    )
+
+
+def connect_target_database(
+    target_mode: str,
+    duckdb_path: Path,
+    motherduck_db: str,
+    motherduck_token_env: str,
+) -> tuple[duckdb.DuckDBPyConnection, str]:
+    if target_mode == "local":
+        duckdb_path.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(str(duckdb_path))
+        target_database = str(duckdb_path)
+        logging.info("Connected to local DuckDB target: %s", target_database)
+
+    elif target_mode == "motherduck":
+        ensure_motherduck_token(motherduck_token_env)
+
+        md_connection = f"md:{motherduck_db}" if motherduck_db else "md:"
+        con = duckdb.connect(md_connection)
+        target_database = md_connection
+
+        logging.info("Connected to MotherDuck target: %s", target_database)
+
+    else:
+        raise ValueError(f"Unsupported target mode: {target_mode}")
+
     load_sqlite_extension(con)
 
-    return con
+    return con, target_database
 
 
 def attach_sqlite_source(
@@ -136,15 +170,6 @@ def attach_sqlite_source(
 
 
 def source_table_ref(table: SourceTable) -> str:
-    """
-    Build a fully qualified table reference.
-
-    Usually attached SQLite tables appear as:
-        "halo_src"."main"."table_name"
-
-    Some DuckDB versions / attachment modes may expose them differently,
-    so this function supports two-part and three-part references.
-    """
     parts = [part for part in [table.catalog, table.schema, table.name] if part]
     return ".".join(quote_ident(part) for part in parts)
 
@@ -157,15 +182,6 @@ def discover_source_tables(
     con: duckdb.DuckDBPyConnection,
     source_alias: str,
 ) -> list[SourceTable]:
-    """
-    Discover source tables from the attached SQLite database.
-
-    Preferred path:
-        information_schema.tables where table_catalog = attached alias
-
-    Fallback path:
-        information_schema.tables where table_schema = attached alias
-    """
     catalog_rows = con.execute(
         """
         SELECT
@@ -214,12 +230,6 @@ def get_source_columns(
     con: duckdb.DuckDBPyConnection,
     source_table: SourceTable,
 ) -> list[tuple[str, str]]:
-    """
-    Inspect columns by describing a SELECT from the source relation.
-
-    This avoids relying too much on the exact catalog/schema layout exposed
-    by DuckDB for attached SQLite databases.
-    """
     rows = con.execute(
         f"""
         DESCRIBE SELECT *
@@ -257,9 +267,6 @@ def table_exists(
 
 
 def unique_column_name(existing_columns: list[str], preferred_name: str) -> str:
-    """
-    Avoid metadata-column collisions with source data.
-    """
     existing_lower = {column.lower() for column in existing_columns}
 
     if preferred_name.lower() not in existing_lower:
@@ -286,6 +293,8 @@ def ensure_internal_metadata_tables(
         f"""
         CREATE TABLE IF NOT EXISTS {quote_ident(metadata_schema)}.stage_audit (
             run_id TEXT,
+            target_mode TEXT,
+            target_database TEXT,
             source_catalog TEXT,
             source_schema TEXT,
             source_table TEXT,
@@ -305,6 +314,8 @@ def ensure_internal_metadata_tables(
         f"""
         CREATE TABLE IF NOT EXISTS {quote_ident(metadata_schema)}.source_manifest (
             run_id TEXT,
+            target_mode TEXT,
+            target_database TEXT,
             source_catalog TEXT,
             source_schema TEXT,
             source_table TEXT,
@@ -319,6 +330,8 @@ def ensure_internal_metadata_tables(
 def write_source_manifest(
     con: duckdb.DuckDBPyConnection,
     run_id: str,
+    target_mode: str,
+    target_database: str,
     source_table: SourceTable,
     metadata_schema: str,
     columns: list[tuple[str, str]],
@@ -329,10 +342,12 @@ def write_source_manifest(
         con.execute(
             f"""
             INSERT INTO {quote_ident(metadata_schema)}.source_manifest
-            VALUES (?, ?, ?, ?, ?, ?, ?);
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
             """,
             [
                 run_id,
+                target_mode,
+                target_database,
                 source_table.catalog,
                 source_table.schema,
                 source_table.name,
@@ -351,10 +366,12 @@ def write_stage_audit(
     con.execute(
         f"""
         INSERT INTO {quote_ident(metadata_schema)}.stage_audit
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """,
         [
             result.run_id,
+            result.target_mode,
+            result.target_database,
             result.source_catalog,
             result.source_schema,
             result.source_table,
@@ -373,6 +390,8 @@ def write_stage_audit(
 def stage_single_table(
     con: duckdb.DuckDBPyConnection,
     run_id: str,
+    target_mode: str,
+    target_database: str,
     source_table: SourceTable,
     staging_schema: str,
     metadata_schema: str,
@@ -410,6 +429,8 @@ def stage_single_table(
 
             result = StageResult(
                 run_id=run_id,
+                target_mode=target_mode,
+                target_database=target_database,
                 source_catalog=source_table.catalog,
                 source_schema=source_table.schema,
                 source_table=source_table.name,
@@ -431,6 +452,8 @@ def stage_single_table(
         write_source_manifest(
             con=con,
             run_id=run_id,
+            target_mode=target_mode,
+            target_database=target_database,
             source_table=source_table,
             metadata_schema=metadata_schema,
             columns=columns,
@@ -458,6 +481,8 @@ def stage_single_table(
 
         result = StageResult(
             run_id=run_id,
+            target_mode=target_mode,
+            target_database=target_database,
             source_catalog=source_table.catalog,
             source_schema=source_table.schema,
             source_table=source_table.name,
@@ -486,6 +511,8 @@ def stage_single_table(
 
         result = StageResult(
             run_id=run_id,
+            target_mode=target_mode,
+            target_database=target_database,
             source_catalog=source_table.catalog,
             source_schema=source_table.schema,
             source_table=source_table.name,
@@ -509,9 +536,6 @@ def create_quality_views(
     staging_schema: str,
     metadata_schema: str,
 ) -> None:
-    """
-    Create small utility views that make the staged layer feel more warehouse-like.
-    """
     create_schema_if_missing(con, staging_schema)
 
     con.execute(
@@ -542,6 +566,8 @@ def create_quality_views(
         )
         SELECT
             run_id,
+            target_mode,
+            target_database,
             source_catalog,
             source_schema,
             source_table,
@@ -573,6 +599,8 @@ def create_quality_views(
         )
         SELECT
             run_id,
+            target_mode,
+            target_database,
             source_catalog,
             source_schema,
             source_table,
@@ -589,9 +617,9 @@ def create_quality_views(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Stage a HaloArchives-style SQLite source into a DuckDB analytical "
-            "landing zone with audit metadata, source manifests, quality views, "
-            "transactional table materialization, and JSON run output."
+            "Stage a HaloArchives-style SQLite source into either a local DuckDB "
+            "database or a MotherDuck database with audit metadata, source manifests, "
+            "quality views, transactional materialization, and JSON run output."
         )
     )
 
@@ -603,10 +631,32 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--target",
+        choices=["local", "motherduck"],
+        default="local",
+        help="Target backend. Use `local` for a .duckdb file or `motherduck` for MotherDuck.",
+    )
+
+    parser.add_argument(
         "--duckdb-db",
         type=Path,
         default=DEFAULT_DUCKDB_DB,
-        help=f"Path to the target DuckDB database. Default: {DEFAULT_DUCKDB_DB}",
+        help=f"Path to the local DuckDB database. Default: {DEFAULT_DUCKDB_DB}",
+    )
+
+    parser.add_argument(
+        "--motherduck-db",
+        default=DEFAULT_MOTHERDUCK_DB,
+        help=f"MotherDuck database name. Default: {DEFAULT_MOTHERDUCK_DB}",
+    )
+
+    parser.add_argument(
+        "--motherduck-token-env",
+        default="MOTHERDUCK_TOKEN",
+        help=(
+            "Environment variable containing a MotherDuck token. "
+            "If `motherduck_token` is already set, that is used directly."
+        ),
     )
 
     parser.add_argument(
@@ -618,13 +668,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--staging-schema",
         default="staging",
-        help="DuckDB schema where staged tables will be materialized.",
+        help="DuckDB / MotherDuck schema where staged tables will be materialized.",
     )
 
     parser.add_argument(
         "--metadata-schema",
         default="_halo_internal",
-        help="DuckDB schema where audit and manifest metadata will be stored.",
+        help="Schema where audit and manifest metadata will be stored.",
     )
 
     parser.add_argument(
@@ -660,20 +710,37 @@ def main() -> int:
     args = parse_args()
     configure_logging(args.verbose)
 
-    run_id = build_run_id(args.sqlite_db)
+    target_database_label = (
+        str(args.duckdb_db)
+        if args.target == "local"
+        else f"md:{args.motherduck_db}"
+    )
+
+    run_id = build_run_id(
+        sqlite_db=args.sqlite_db,
+        target_mode=args.target,
+        target_database=target_database_label,
+    )
+
     overwrite = not args.no_overwrite
 
     con: duckdb.DuckDBPyConnection | None = None
     results: list[StageResult] = []
 
-    logging.info("Starting HaloArchives DuckDB staging run")
+    logging.info("Starting DuckDB-HA staging run")
     logging.info("Run ID: %s", run_id)
+    logging.info("Target mode: %s", args.target)
     logging.info("Source SQLite: %s", args.sqlite_db)
-    logging.info("Target DuckDB: %s", args.duckdb_db)
+    logging.info("Target database: %s", target_database_label)
     logging.info("Overwrite enabled: %s", overwrite)
 
     try:
-        con = connect_duckdb(args.duckdb_db)
+        con, target_database = connect_target_database(
+            target_mode=args.target,
+            duckdb_path=args.duckdb_db,
+            motherduck_db=args.motherduck_db,
+            motherduck_token_env=args.motherduck_token_env,
+        )
 
         attach_sqlite_source(
             con=con,
@@ -723,6 +790,8 @@ def main() -> int:
             result = stage_single_table(
                 con=con,
                 run_id=run_id,
+                target_mode=args.target,
+                target_database=target_database,
                 source_table=source_table,
                 staging_schema=args.staging_schema,
                 metadata_schema=args.metadata_schema,
@@ -766,8 +835,11 @@ def main() -> int:
 
         manifest = {
             "run_id": run_id,
+            "target_mode": args.target,
+            "target_database": target_database,
             "source_sqlite_db": str(args.sqlite_db),
-            "target_duckdb_db": str(args.duckdb_db),
+            "local_duckdb_db": str(args.duckdb_db),
+            "motherduck_db": args.motherduck_db,
             "source_alias": args.source_alias,
             "staging_schema": args.staging_schema,
             "metadata_schema": args.metadata_schema,
@@ -787,7 +859,7 @@ def main() -> int:
         )
 
         logging.info("Wrote JSON manifest: %s", args.manifest_json)
-        logging.info("Completed HaloArchives DuckDB staging run")
+        logging.info("Completed DuckDB-HA staging run")
 
         return 1 if failed_count else 0
 
